@@ -1,28 +1,41 @@
-/**
- * Creates a state and a function that operates on that state to increment line and column numbers
- *
- * See React Hooks for a similar concept
- * @param obj optional initial position state
- */
-export const usePositionState = (
-  obj: { line: number; col: number } = { line: 1, col: 0 },
-) => {
-  const state = { ...obj }
+export const useState = <T extends string>(initState: T) => {
+  const s = {
+    value: initState,
+  }
+
+  const setState = (newState: T) => {
+    if (s.value !== newState) s.value = newState
+  }
 
   return {
-    pos: state as Readonly<typeof state>,
-    setPosFrom: (v: string) => {
-      if (v === '\n') {
-        state.line++
-        state.col = 0
-      } else {
-        state.col += v.length
-      }
-    },
-    reset: () => {
-      state.line = obj.line
-      state.col = obj.col
-    }
-  } as const
-
+    state: s as Readonly<typeof s>,
+    setState,
+  }
 }
+
+/** Discriminates a tagged union given tag key and value */
+export type DiscriminateUnion<
+  Union,
+  TagKey extends keyof Union,
+  TagValue extends Union[TagKey]
+> = Union extends Record<TagKey, TagValue> ? Union : never
+
+export const useDeferred = <T = never>(): readonly [
+  promise: Promise<T>,
+  resolve: (value: T | PromiseLike<T>) => void,
+  reject: (err?: any) => void,
+] => {
+  let resolve: (value: T | PromiseLike<T>) => void
+  let reject: (value: T) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+
+  return [promise, resolve!, reject!] as const
+}
+
+export const arrEquals = <T>(Eq: (x: T, y: T) => boolean) => (
+  xs: T[],
+  ys: T[],
+) => xs.length === ys.length && xs.every((v, i) => Eq(v, ys[i]))

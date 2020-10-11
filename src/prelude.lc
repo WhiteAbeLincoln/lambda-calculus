@@ -1,0 +1,154 @@
+## combinators ##
+
+# identity
+I = \x. x
+id = I
+
+# thrush
+T = \x. \y. y x
+
+# K combinator. Equivalent to true church boolean
+K = \x. \y. x
+constant = K
+
+W = \f. \x. f x x
+
+# c combinator, flip
+C = \f. \x. \y. f y x
+flip = C
+
+# B combinator, compose
+B = \f. \g. \x. f (g x)
+compose = B
+
+S = \f. \g. \x. f x (g x)
+
+P = \f. \g. \x. \y. f (g x) (g y)
+
+# divergent combinator
+Omega = (\x. x x) (\x. x x)
+
+# the Z combinator, or strict Y-combinator
+Z = \f. (\x. f (\y. x x y)) (\x. f (\y. x x y))
+fix = Z
+
+## Boolean Logic ##
+
+# church booleans
+true = \t. \f. t
+false = \t. \f. f
+
+if = \bool. \t. \f. bool t f
+# returns c if b is true, false if b is false, therefore true when both c and b are true
+and = \b. \c. b c false
+# returns true if b is true, c if b is false, therefore true when c or b are true
+or = \b. \c. b true c
+# returns false when b is true, true when b is false
+not = \b. b false true
+
+## Numbers ##
+# church numerals
+succ = \n. \s. \z. s (n s z)
+0 = \s. \z. z
+1 = \s. \z. s z
+2 = succ 1
+3 = succ 2
+4 = succ 3
+5 = succ 4
+6 = succ 5
+7 = succ 6
+8 = succ 7
+9 = succ 8
+10 = succ 9
+
+# numbers take the form \s. \z. ... We bind (\x. false) to s, and true to z
+# if our number is zero, it returns z directly, which is bound to true
+# if our number is not zero, it calls the successor function s, which returns false
+zero? = \n. n (constant false) true
+
+plus = \m. \n. \s. \z. m s (n s z)
+# notice the body s (n s z) is equivalent to succ n, so an alternative definition is
+# plus = \m. \n. m succ n
+times = \m. \n. \f. m (n f)
+# alternative defintion
+# times = \m. \n. m (plus n) 0
+pow = \b. \e. e b
+
+
+## Data Structures ##
+
+# saves two values, f and s, then selects using a boolean function
+pair = \f. \s. \b. b f s
+fst = \p. p true
+snd = \p. p false
+
+# lists
+## Right Fold Encoding
+# # the empty list
+# nil = \c. \n. n
+# # if l is nil, it returns the second argument, which is true
+# # if l is not nil, it calls the function which returns false
+# nil? = \l. l (\h. \t. false) true
+#
+# # remember, head and tail (and all lists) are functions of the form \c. \n. ...
+# # we add head onto the list by passing it to c
+# cons = \h. \t. \c. \n. c h (t c n)
+#
+# # like lisp head, returns the head if it exists, nil otherwise
+# head = \l. l (\h. \t. h) nil
+#
+# tail = \l. \c. \n. l (\h. \t. \g. g h (t c)) (\t. n) (\h. \t. t)
+## Scott Encoding
+# We encode lists as a pattern matching expression
+# In Haskell
+# list xs = case xs of
+#             Nil -> nilCode
+#             Cons h t -> consCode h t
+# In the lambda calculus, list is a function that acts on these nilCode and consCode
+# so we write list (consCode h t) nilCode
+#
+# nil is the empty list, so we have a function of two arguments, a cons code and a nil code
+# nil always returns the nil code
+nil = \c. \n. n
+# cons appends onto a list returning a new list
+cons = \h. \t. \c. \n. c h t
+
+# remember a list is just a pattern match
+# the first argument is the cons case, second the nil case
+# we return nil in the case of nil
+# in the case of cons, we recieve head and tail as arguments
+# returning head
+head = \l. l (\h. \t. h) nil
+tail = \l. l (\h. \t. t) nil
+nil? = \l. l (\h. \t. false) true
+# maps the given function over list elements
+map = fix (\_map. \f. \l.
+           (l (\h. \t. cons (f h) (_map f t))
+              nil))
+foldr = fix (\_fold. \f. \z. \l.
+            (l (\x. \xs. f x (_fold f z xs))
+               z))
+foldl = fix (\_fold. \f. \z. \l.
+            (l (\x. \xs. _fold f (f z x) xs)
+               z))
+len = foldl (\_. \n. (succ n)) 0
+
+
+## Numbers (Cont.) ##
+# maps (m, n) to (n, n+1)
+φ = \p. pair (snd p) (succ (snd p))
+# applies the φ function to (0,0) n times, meaning the first element is n-1
+pred = \n. fst (n φ (pair 0 0))
+
+# n pred creates a function which gets the nth predecesor of its argument
+# i.e. subtracts 1 from its argument n times. This is m - n
+sub = \m. \n. n pred m
+
+leq? = \m. \n. zero? (sub m n)
+# identity x = y === (x <= y ^ y <= x)
+eq? = \m. \n. and (leq? m n) (leq? n m)
+
+# sums a list of church-encoded numbers
+sum = fix (\_sum. \l. l (\h. \t. succ (_sum t)) 0)
+## sum implemented with foldl
+# sum = foldl plus 0

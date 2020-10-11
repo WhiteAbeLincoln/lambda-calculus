@@ -1,13 +1,21 @@
-import { usePositionState } from './util'
+import { dummyinfo, Info } from './support'
+import { DiscriminateUnion, useState } from './util'
 
 export interface TokenBase {
   value: string
-  line: number
-  column: number
+  info: Info
+  /**
+   * extra insignificant whitespace occuring before the token, used for printing errors
+   */
+  extra: string
 }
-export interface ParenTok extends TokenBase {
-  kind: 'paren'
-  value: '(' | ')'
+export interface OParenTok extends TokenBase {
+  kind: 'openparen'
+  value: '('
+}
+export interface CParenTok extends TokenBase {
+  kind: 'closeparen'
+  value: ')'
 }
 export interface DotTok extends TokenBase {
   kind: 'dot'
@@ -25,17 +33,104 @@ export interface EqualsTok extends TokenBase {
   kind: 'equals'
   value: '='
 }
-type Token = ParenTok | DotTok | BackslashTok | VarTok | EqualsTok
+export interface SemiTok extends TokenBase {
+  kind: 'semicolon'
+  value: ';'
+}
+// we automatically insert semicolons at newlines in parsing
+// unless we are in the middle of a parenthesized expression
+export interface NewlineTok extends TokenBase {
+  kind: 'newline'
+  value: '\n'
+}
+
+export type Token =
+  | OParenTok
+  | CParenTok
+  | DotTok
+  | BackslashTok
+  | VarTok
+  | EqualsTok
+  | SemiTok
+  | NewlineTok
+
+export const tokIs = <K extends Token['kind']>(k: K) => (
+  t: Token,
+): t is DiscriminateUnion<Token, 'kind', K> => t.kind === k
+
+export const mkTok = <K extends Token['kind']>(kind: K) =>
+  ({
+    info: dummyinfo,
+    kind,
+    value:
+      kind === 'backslash'
+        ? '\\'
+        : kind === 'dot'
+        ? '.'
+        : kind === 'equals'
+        ? '='
+        : kind === 'newline'
+        ? '\n'
+        : kind === 'openparen'
+        ? '('
+        : kind === 'closeparen'
+        ? ')'
+        : kind === 'semicolon'
+        ? ';'
+        : kind === 'var'
+        ? ''
+        : kind,
+    extra: '',
+  } as DiscriminateUnion<Token, 'kind', K>)
+
+export const tokEquals = (x: Token, y: Token) =>
+  x.kind === y.kind && x.value === y.value
 
 const whitespace = /^\s$/
 
-const useAccum = <T extends string>() => (initState: T) => {
+/**
+ * Creates a state and a function that operates on that state to increment line and column numbers
+ *
+ * See React Hooks for a similar concept
+ * @param obj optional initial position state
+ */
+export const usePositionState = (
+  obj: { line: number; col: number } = { line: 1, col: 0 },
+) => {
+  const state = { ...obj }
+  let newline = false
+
+  return {
+    pos: state as Readonly<typeof state>,
+    setPosFrom: (v: string) => {
+      if (newline) {
+        state.line += 1
+        state.col = 0
+        newline = false
+      }
+
+      // we count newlines as the last character
+      // on the current line, but we must remember
+      // to increment the line number for the next character
+      if (v === '\n') {
+        newline = true
+        state.col += 1
+      } else {
+        state.col += v.length
+      }
+    },
+    reset: () => {
+      state.line = obj.line
+      state.col = obj.col
+    },
+  } as const
+}
+
+const useAccum = () => {
   let s: {
-    state: T
     pos: { line: number; col: number }
     accum: string
   } = {
-    state: initState,
     pos: { line: 0, col: 0 },
     accum: '',
   }
@@ -45,13 +140,8 @@ const useAccum = <T extends string>() => (initState: T) => {
   const reset = () => {
     const oldState = copy()
     s.pos = { line: 0, col: 0 }
-    s.state = initState
     s.accum = ''
     return oldState
-  }
-
-  const changeState = (newState: T) => {
-    if (s.state !== newState) s.state = newState
   }
 
   const accumulate = (char: string, pos: { line: number; col: number }) => {
@@ -64,75 +154,133 @@ const useAccum = <T extends string>() => (initState: T) => {
   return {
     state: s as Readonly<typeof s>,
     reset,
-    changeState,
     accumulate,
   } as const
 }
 
-export const useScanner = () => {
-  const { state: accum, reset, accumulate, changeState } = useAccum<
-    'none' | 'var'
-  >()('none')
+export const useScanner = (filen = '') => {
+  const { state, setState: changeState } = useState<'none' | 'var' | 'comment'>(
+    'none',
+  )
+  const { reset: resetAccum, accumulate } = useAccum()
+  const { reset: resetW, accumulate: accumW } = useAccum()
   const { pos, setPosFrom } = usePositionState()
 
-  const read = (c: string): Token | undefined => {
+  const tok = <K extends Token['kind']>(kind: K) => ({
+    ...mkTok(kind),
+    info: {
+      filen,
+      line: pos.line,
+      column: pos.col,
+    },
+  })
+
+  const handleVar = () => {
+    changeState('none')
+    const a = resetAccum()
+    const w = resetW()
+    return {
+      info: {
+        filen,
+        line: a.pos.line,
+        column: a.pos.col,
+      },
+      kind: 'var',
+      value: a.accum,
+      extra: w.accum,
+    } as const
+  }
+
+  const ret = <K extends Token['kind']>(
+    kind?: K,
+    value?: DiscriminateUnion<Token, 'kind', K>['value'],
+  ) => {
+    const toks: Token[] = []
+    if (state.value === 'var') {
+      toks.push(handleVar())
+    }
+    if (kind) {
+      const v = tok(kind)
+      const w = resetW()
+      if (value !== undefined) v.value = value
+      v.extra = w.accum
+      toks.push(v)
+    }
+
+    return toks
+  }
+
+  const read = (c: string): Token[] => {
     setPosFrom(c)
+    if (state.value === 'comment') {
+      if (
+        c === '\n' ||
+        c === '\r' ||
+        c === '\u0085' ||
+        c === '\u2028' ||
+        c === '\u2029' ||
+        c === ''
+      ) {
+        changeState('none')
+        return []
+      } else {
+        return []
+      }
+    }
+
     if (whitespace.test(c)) {
-      if (accum.state === 'var') {
-        const a = reset()
-        return {
-          kind: 'var',
-          value: a.accum,
-          line: a.pos.line,
-          column: a.pos.col,
-        }
+      if (c === '\n') {
+        return ret('newline')
       }
-      return undefined
+      accumW(c, pos)
+      return ret()
     }
 
-    if (c === '(' || c === ')') {
-      return {
-        kind: 'paren',
-        value: c,
-        line: pos.line,
-        column: pos.col,
-      }
-    }
+    if (c === '(' || c === ')')
+      return c === '(' ? ret('openparen') : ret('closeparen')
+    if (c === '.') return ret('dot')
+    if (c === '\\') return ret('backslash')
+    if (c === '=') return ret('equals')
+    if (c === ';') return ret('semicolon')
 
-    if (c === '.') {
-      return {
-        kind: 'dot',
-        value: '.',
-        line: pos.line,
-        column: pos.col,
-      }
-    }
-
-    if (c === '\\') {
-      return {
-        kind: 'backslash',
-        value: c,
-        line: pos.line,
-        column: pos.col,
-      }
-    }
-
-    if (c === '=') {
-      return {
-        kind: 'equals',
-        value: c,
-        line: pos.line,
-        column: pos.col,
-      }
+    if (c === '#') {
+      changeState('comment')
+      return ret()
     }
 
     if (c !== '') {
       changeState('var')
       accumulate(c, pos)
+      return []
     }
 
-    return undefined
+    // should never reach this unless c === ''
+    return []
   }
 
   return { pos, read } as const
+}
+
+export function* scanner(input: string, filen = '') {
+  const { read } = useScanner(filen)
+  for (const char of input) {
+    yield* read(char)
+  }
+}
+
+export async function* streamScanner(
+  stream: AsyncIterable<Buffer | string>,
+  filen = '',
+) {
+  const { read } = useScanner(filen)
+  for await (const buff of stream) {
+    const chars = buff.toString('utf8')
+    for (const char of chars) {
+      yield* read(char)
+    }
+  }
+}
+
+export const showToken = (t: Token) => {
+  return `${t.extra}${t.value}`
 }
