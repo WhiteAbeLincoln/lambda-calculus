@@ -65,21 +65,43 @@ export type Command = EvalCommand | BindCommand
 /** Maps over the abstract syntax tree of terms */
 export const termWalk = (fn: (v: VariableNode, depth: number) => Term) => (
   startDepth: number = 0,
-) => (t: Term): Term => {
-  function walk(c: number, t: Term): Term {
+) => (initTerm: Term): Term => {
+  const stack: Array<{ c: number; t: Term }> = []
+  const term = { ...initTerm }
+  stack.push({ c: startDepth, t: term })
+
+  while (stack.length !== 0) {
+    const { c, t } = stack.pop()!
     switch (t.kind) {
       case 'var': {
-        return fn(t, c)
+        const s = { ...fn(t, c) }
+        // we have to keep the same reference
+        for (const key in t) {
+          if (t.hasOwnProperty(key)) {
+            delete (t as any)[key]
+          }
+        }
+        Object.assign(t, s)
+        break
       }
       case 'abs': {
-        return { ...t, term: walk(c + 1, t.term) }
+        const term = { ...t.term }
+        t.term = term
+        stack.push({ c: c + 1, t: term })
+        break
       }
       case 'app': {
-        return { ...t, left: walk(c, t.left), right: walk(c, t.right) }
+        const left = { ...t.left }
+        const right = { ...t.right }
+        t.left = left
+        t.right = right
+        stack.push({ c, t: left })
+        stack.push({ c, t: right })
+        break
       }
     }
   }
-  return walk(startDepth, t)
+  return term
 }
 
 type PeekReq = {
@@ -118,6 +140,14 @@ const expectFinished: (
   t: TokResponse,
 ) => asserts t is FinishedResponse = expectResponse('finished')
 
+/**
+ * Parses using a generator function
+ *
+ * The generator sends out a TokRequest, which is either to read a token,
+ * peek (lookahead) at some number of tokens, or see if the token input
+ * is finished. The generator caller returns a TokResponse. Helper
+ * functions assert that the response correctly matches the request.
+ */
 function* parse(ctx: Context) {
   function* peek(
     k = 1,
@@ -297,6 +327,9 @@ function* parse(ctx: Context) {
   } while (e !== null)
 }
 
+/**
+ * accepts an iterable of tokens, returns an iterable of Commands and Contexts
+ */
 export function* parser(toks: Iterable<Token>, ctx: Context) {
   const tokens = [...toks]
   let lastInfo: Info | undefined = undefined
@@ -338,6 +371,9 @@ export function* parser(toks: Iterable<Token>, ctx: Context) {
   return reqr.value
 }
 
+/**
+ * accepts an async iterable of tokens, returns an async iterable of Commands and Contexts
+ */
 export async function* streamParser(
   stream: AsyncIterable<Token>,
   ctx: Context,

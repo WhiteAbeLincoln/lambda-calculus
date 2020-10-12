@@ -50,31 +50,44 @@ async function main(args: string[]) {
     const [promise, res, rej] = useDeferred<undefined>()
 
     rl.on('line', input => {
-      if (input.trim() === ':reset') {
-        ctx = startctx
-        console.log('Reset context')
-      } else if (input.trim() === ':quit' || input.trim() === ':q') {
-        rl.close()
-        return
-      } else if (input.trim() !== '') {
-        try {
-          run(([cmd, c]) => {
-            ctx = c
-            if (cmd.kind === 'eval') {
-              console.log(printer(ctx)(evaluate(c, cmd.term)))
+      switch (input.trim()) {
+        case ':reset': {
+          ctx = startctx
+          console.log('Reset context')
+          break
+        }
+        case ':ctx': {
+          console.log(ctx)
+          break
+        }
+        case ':quit':
+        case ':q': {
+          rl.close()
+          return
+        }
+        case '': {
+          break
+        }
+        default: {
+          try {
+            run(([cmd, c]) => {
+              ctx = c
+              console.log(
+                cmd.kind === 'eval'
+                  ? printer(ctx)(evaluate(c, cmd.term))
+                  : cmd.binding.kind === 'var'
+                  ? `${cmd.name} = ${printer(ctx.slice(1))(cmd.binding.term)}`
+                  : cmd.name,
+              )
+            })(input.trim() + '\n', ctx, 'repl')
+          } catch (e) {
+            // we want to recover from parsing errors
+            // but reject on runtime/js errors
+            if (e instanceof InfoError) {
+              console.error(e.message)
             } else {
-              if (cmd.binding.kind === 'var') {
-                console.log(
-                  `${cmd.name} = ${printer(ctx.slice(1))(cmd.binding.term)}`,
-                )
-              } else {
-                console.log(cmd.name)
-              }
+              rej(e)
             }
-          })(input + '\n', ctx, 'repl')
-        } catch (e) {
-          if (e instanceof InfoError) {
-            console.error(e.message)
           }
         }
       }
@@ -101,6 +114,8 @@ main(args)
   .catch(v => {
     if (v instanceof InfoError) {
       console.error(v.message)
+    } else {
+      console.error(v)
     }
     process.exit(1)
   })
