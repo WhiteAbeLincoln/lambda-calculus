@@ -176,19 +176,24 @@ export const useScanner = (filen = '') => {
   })
 
   const handleVar = () => {
-    changeState('none')
-    const a = resetAccum()
-    const w = resetW()
-    return {
-      info: {
-        filen,
-        line: a.pos.line,
-        column: a.pos.col,
-      },
-      kind: 'var',
-      value: a.accum,
-      extra: w.accum,
-    } as const
+    if (state.value === 'var') {
+      changeState('none')
+      const a = resetAccum()
+      const w = resetW()
+      return [
+        {
+          info: {
+            filen,
+            line: a.pos.line,
+            column: a.pos.col,
+          },
+          kind: 'var',
+          value: a.accum,
+          extra: w.accum,
+        } as const,
+      ]
+    }
+    return []
   }
 
   const ret = <K extends Token['kind']>(
@@ -197,7 +202,7 @@ export const useScanner = (filen = '') => {
   ) => {
     const toks: Token[] = []
     if (state.value === 'var') {
-      toks.push(handleVar())
+      toks.push(...handleVar())
     }
     if (kind) {
       const v = tok(kind)
@@ -222,10 +227,8 @@ export const useScanner = (filen = '') => {
         c === ''
       ) {
         changeState('none')
-        return []
-      } else {
-        return []
       }
+      return []
     }
 
     if (whitespace.test(c)) {
@@ -254,8 +257,13 @@ export const useScanner = (filen = '') => {
       return []
     }
 
-    // should never reach this unless c === ''
-    return []
+    if (c === '') {
+      // if we are in a var, completes it
+      return ret()
+    }
+
+    // should never reach this, c is never
+    return c
   }
 
   return { pos, read } as const
@@ -266,6 +274,7 @@ export function* scanner(input: string, filen = '') {
   for (const char of input) {
     yield* read(char)
   }
+  yield* read('')
 }
 
 export async function* streamScanner(
@@ -279,6 +288,7 @@ export async function* streamScanner(
       yield* read(char)
     }
   }
+  yield* read('')
 }
 
 export const showToken = (t: Token) => {

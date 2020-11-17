@@ -1,4 +1,3 @@
-import { Term } from '../parser'
 
 /**
  * We can represent a nameless term as a tree where leaves with pointers are variables,

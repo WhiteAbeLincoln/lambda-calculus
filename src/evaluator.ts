@@ -1,133 +1,135 @@
-import { Binding, Context, ctxlength } from './context'
+import { Binding, Context, ctxlength, index2binding } from './context'
 import {
   AbstractionNode,
   ApplicationNode,
   Term,
-  termWalk,
-} from './parser'
+  VariableNode,
+} from './parser/term'
+import { shiftForCtx, termShift, termSubstTop } from './shift'
 import { errorOnUndef } from './support'
+import { printer } from './printer'
 
-// shifting
-export const termShiftAbove = (d: number) =>
-  termWalk((v, c) =>
-    v.idx >= c
-      ? { ...v, idx: v.idx + d, depth: v.depth + d }
-      : { ...v, depth: v.depth + d },
-  )
-
-export const termShift = (d: number) => termShiftAbove(d)(0)
 export const bindingShift = (d: number) => (b: Binding): Binding =>
   b.kind === 'name'
     ? b
     : b.kind === 'var'
     ? { ...b, term: termShift(d)(b.term) }
     : b
-
-// substitution
-export const termSubst = (j: number) => (s: Term) =>
-  termWalk((v, c) => (v.idx === j + c ? termShift(c)(s) : v))(0)
-
-export const termSubstTop = (s: Term) => (t: Term) =>
-  termShift(-1)(termSubst(0)(termShift(1)(s))(t))
-
-export const getbinding = (ctx: Context, idx: number): Binding | undefined => {
-  const bind = ctx[idx]?.[1] as Binding | undefined
-  return bind && bindingShift(idx + 1)(bind)
+export const getbinding = (ctx: Context, idx: number) => {
+  const bind = index2binding(ctx, idx)
+  return bind && ([bind[0], bindingShift(idx + 1)(bind[1])] as const)
 }
 
 const isval = (_ctx: Context, t: Term): t is AbstractionNode => t.kind === 'abs'
 
-type StackFrame =
-  | { kind: 'appleft'; term: ApplicationNode }
-  | { kind: 'appright'; term: ApplicationNode }
-
-type Stack = StackFrame[]
-function consumeStack(
-  stack: Stack,
-  value: Term | undefined,
-): Term | undefined {
-  while (stack.length !== 0) {
-    const frame = stack.pop()!
-    switch (frame.kind) {
-      case 'appleft': {
-        value = value && { ...frame.term, left: value }
-        break
-      }
-      case 'appright': {
-        value = value && { ...frame.term, right: value }
-        break
-      }
-    }
-  }
-  return value
+const getBindingForVar = (ctx: Context, term: VariableNode) => {
+  const { idx, info } = term
+  return errorOnUndef(
+    info,
+    `Variable lookup failure: offset ${idx}, ctx size: ${ctxlength(ctx)}`,
+    getbinding(ctx, idx),
+  )
 }
 
-const eval1 = (
-  ctx: Context,
-  initTerm: Term,
-  initStack: Stack = [],
-): Term | undefined => {
-  const evalStack: Array<{ t: Term, stk: Stack }> = []
-  evalStack.push({ t: initTerm, stk: initStack })
-  let result: Term | undefined = undefined
+export const evaluate = (initCtx: Context, initTerm: Term) => {
+  const print: typeof printer = (...args) => printer(...args)
+  type StackFrame =
+    | { kind: 'appleft'; t: ApplicationNode }
+    | { kind: 'appright'; t: ApplicationNode }
 
-  while (evalStack.length !== 0) {
-    const { t, stk } = evalStack.pop()!
-    switch (t.kind) {
-      case 'var': {
-        const { idx, info } = t
-        const binding = errorOnUndef(
-          info,
-          `Variable lookup failure: offset ${idx}, ctx size: ${ctxlength(ctx)}`,
-          getbinding(ctx, idx),
-        )
-        result = consumeStack(stk, binding.kind === 'var' ? binding.term : undefined)
-        continue
-      }
-      case 'app': {
-        if (t.left.kind === 'abs' && isval(ctx, t.right)) {
-          result = consumeStack(stk, termSubstTop(t.right)(t.left.term))
+  let term = initTerm
+  let ctx = initCtx
+  let r: Term | undefined = undefined
+  do {
+    const evalstack: Term[] = [term]
+    const stack: StackFrame[] = []
+    while (evalstack.length !== 0) {
+      const term = evalstack.pop()!
+      switch (term.kind) {
+        case 'var': {
+          const binding = getBindingForVar(ctx, term)
+          const v =
+            binding[1].kind === 'var'
+              ? ({ ...binding[1].term, bindingname: binding[0] } as Term)
+              : undefined
+          r = consumeStack(stack, v)
           continue
         }
-        // handle builtin bindings
-        if (t.left.kind === 'var') {
-          const { idx, info } = t.left
-          const binding = errorOnUndef(
-            info,
-            `Variable lookup failure: offset ${idx}, ctx size: ${ctxlength(ctx)}`,
-            getbinding(ctx, idx),
-          )
-          if (binding.kind === 'builtin') {
-            // will only stack overflow if we have a lot of builtins referencing each other
-            // very unlikely
-            const right = evaluate(ctx, t.right)
-            result = consumeStack(stk, binding.handler(right, ctx) ?? t.right)
+        case 'app': {
+          if (term.left.kind === 'abs' && isval(ctx, term.right)) {
+            const v = termSubstTop(term.right, term.left.term)
+            r = consumeStack(
+              stack,
+              v && { ...v, bindingname: term.bindingname },
+            )
             continue
           }
+          if (isval(ctx, term.left)) {
+            stack.push({ kind: 'appright', t: term })
+            evalstack.push(term.right)
+            continue
+          }
+          // handle builtin bindings
+          if (term.left.kind === 'var') {
+            const binding = getBindingForVar(ctx, term.left)
+            if (binding[1].kind === 'builtin') {
+              const right = evaluate(ctx, term.right)
+              const bindres = binding[1].handler(right, ctx)
+              if (!bindres) {
+                r = consumeStack(stack, term.right)
+              } else {
+                // if context changes, we need to perform a shift
+                // assume we always change context by adding or removing from
+                // front. if diff is positive that means we added, and need to
+                // shift all indexes past diff - 1
+                // if diff is negative, then we shift all indexes from 0 up
+                const mapper = shiftForCtx(ctx, bindres[0])
+                // we assume the term returned by the handler is already
+                // correct relative to the new context. Just map any pending
+                // terms in the stack
+                // TODO: should we also map evalstack?
+                r = consumeStack(
+                  stack.map((s): typeof s => ({
+                    ...s,
+                    t: mapper(s.t) as typeof s.t,
+                  })),
+                  bindres[1],
+                )
+                ctx = bindres[0]
+              }
+              continue
+            }
+          }
+          stack.push({ kind: 'appleft', t: term })
+          evalstack.push(term.left)
+          continue
         }
-        if (isval(ctx, t.left)) {
-          evalStack.push({ t: t.right, stk: [...stk, { kind: 'appright', term: t }] })
-        } else {
-          evalStack.push({ t: t.left, stk: [...stk, { kind: 'appleft', term: t }] })
+        default: {
+          r = consumeStack(stack, undefined)
+          continue
         }
-        continue
-      }
-      default: {
-        result = consumeStack(stk, undefined)
-        continue
       }
     }
+    if (r !== undefined) {
+      term = r
+    }
+  } while (r !== undefined)
+  return term
+
+  function consumeStack(stack: StackFrame[], v: Term | undefined): Term | undefined {
+    while (stack.length !== 0) {
+      const c = stack.pop()!
+      switch (c.kind) {
+        case 'appleft': {
+          v = v && { ...c.t, left: v }
+          break
+        }
+        case 'appright': {
+          v = v && { ...c.t, right: v }
+          break
+        }
+      }
+    }
+    return v
   }
-
-  return result
-}
-
-export const evaluate = (ctx: Context, t: Term): Term => {
-  let oldt = t
-  let t1: Term | undefined = undefined
-  do {
-    t1 = eval1(ctx, oldt)
-    if (t1 !== undefined) oldt = t1
-  } while (t1 !== undefined)
-  return oldt
 }

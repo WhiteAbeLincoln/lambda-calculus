@@ -5,7 +5,7 @@ export type Info = {
 }
 
 export class InfoError extends Error {
-  constructor(readonly info: Info, readonly msg: string) {
+  constructor(readonly info: Info, msg: string) {
     super(`${showInfo(info)} - ${msg}`)
   }
 }

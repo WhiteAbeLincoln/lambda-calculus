@@ -39,3 +39,9 @@ export const arrEquals = <T>(Eq: (x: T, y: T) => boolean) => (
   xs: T[],
   ys: T[],
 ) => xs.length === ys.length && xs.every((v, i) => Eq(v, ys[i]))
+
+export type UnionToIntersection<U> = (
+  U extends any ? (k: U) => void : never
+) extends (k: infer I) => void
+  ? I
+  : never

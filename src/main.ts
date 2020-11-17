@@ -1,13 +1,15 @@
-import { defaultcontext, emptycontext } from './context/contexts'
+import { defaultcontext } from './context/contexts'
 import { evaluate } from './evaluator'
-import { asyncRun, run } from './parser'
+import { asyncRun, run } from './parser/parser'
 import { InfoError } from './support'
 import fs from 'fs'
 import path from 'path'
-import readline from 'readline'
-import { Context } from './context'
+import repl from 'repl'
+import { boundnames, Context, emptycontext, getboundnames } from './context'
 import { printer } from './printer'
 import { useDeferred } from './util'
+import { Console } from 'console'
+import { Term } from './parser/term'
 
 const help = `
 Lambda Calculus
@@ -20,6 +22,96 @@ Options:
   -np           Don't include prelude
   -nb           Don't include builtins
 `
+
+const printWName = (ctx: Context, t: Term) => {
+  const printed = printer(ctx, t)
+  const bound = getboundnames(ctx, t)
+  return bound.length > 0
+    ? `${printed}  # ${bound.join(',')} = ${printer(ctx, t, false)}`
+    : printed
+}
+
+const runInteractive = (
+  ctx: Context,
+  input?: NodeJS.ReadableStream,
+  output?: NodeJS.WritableStream,
+) => {
+  const startctx: Context = ctx
+  const [promise, res] = useDeferred<undefined>()
+  const console = new Console(output || process.stdout)
+  const isRecoverableError = (e: Error) => {
+    if (e instanceof InfoError) {
+      return /but received EOF$/.test(e.message)
+    }
+    return false
+  }
+
+  const replEval: repl.REPLEval = function replEval(
+    evalCmd,
+    _context,
+    file,
+    cb,
+  ) {
+    let result: string | undefined
+    try {
+      run(([cmd, c]) => {
+        const oldctx = ctx
+        ctx = c
+        result =
+          cmd.kind === 'eval'
+            ? printWName(ctx, evaluate(c, cmd.term))
+            : cmd.binding.kind === 'var'
+            ? `${cmd.name} = ${printer(oldctx, cmd.binding.term)}`
+            : cmd.name
+      })(evalCmd + '\n', ctx, file)
+    } catch (e) {
+      if (isRecoverableError(e)) {
+        return cb(new repl.Recoverable(e), undefined)
+      } else if (e instanceof InfoError) {
+        console.error(e.message)
+        return cb(null, undefined)
+      } else {
+        return cb(e, undefined)
+      }
+    }
+
+    cb(null, result)
+  }
+
+  const writer: repl.REPLWriter = function writer(obj) {
+    return obj
+  }
+
+  const replServer = repl.start({
+    prompt: '> ',
+    eval: replEval,
+    input,
+    output,
+    writer,
+    ignoreUndefined: true,
+  })
+  replServer.defineCommand('reset', {
+    help: 'Reset the context',
+    action() {
+      this.clearBufferedCommand()
+      ctx = startctx
+      console.log('Reset context')
+    },
+  })
+  replServer.defineCommand('ctx', {
+    help: 'Print the current context',
+    action() {
+      this.clearBufferedCommand()
+      console.log(boundnames(ctx))
+    },
+  })
+
+  replServer.on('exit', () => {
+    res(undefined)
+  })
+
+  return promise
+}
 
 async function main(args: string[]) {
   if (args.includes('-h') || args.includes('--help')) {
@@ -41,63 +133,7 @@ async function main(args: string[]) {
   }
 
   if (interactive) {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      prompt: '> ',
-    })
-    const startctx: Context = [...ctx]
-    const [promise, res, rej] = useDeferred<undefined>()
-
-    rl.on('line', input => {
-      switch (input.trim()) {
-        case ':reset': {
-          ctx = startctx
-          console.log('Reset context')
-          break
-        }
-        case ':ctx': {
-          console.log(ctx)
-          break
-        }
-        case ':quit':
-        case ':q': {
-          rl.close()
-          return
-        }
-        case '': {
-          break
-        }
-        default: {
-          try {
-            run(([cmd, c]) => {
-              ctx = c
-              console.log(
-                cmd.kind === 'eval'
-                  ? printer(ctx)(evaluate(c, cmd.term))
-                  : cmd.binding.kind === 'var'
-                  ? `${cmd.name} = ${printer(ctx.slice(1))(cmd.binding.term)}`
-                  : cmd.name,
-              )
-            })(input.trim() + '\n', ctx, 'repl')
-          } catch (e) {
-            // we want to recover from parsing errors
-            // but reject on runtime/js errors
-            if (e instanceof InfoError) {
-              console.error(e.message)
-            } else {
-              rej(e)
-            }
-          }
-        }
-      }
-      rl.prompt()
-    }).on('close', () => {
-      res(undefined)
-    })
-
-    rl.prompt()
-    return promise
+    return runInteractive(ctx)
   } else {
     await asyncRun(([cmd, c]) => {
       ctx = c

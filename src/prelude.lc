@@ -38,7 +38,10 @@ fix = Z
 true = \t. \f. t
 false = \t. \f. f
 
-if = \bool. \t. \f. bool t f
+# since we are in an eager language, to have lazy if evaluation
+# we need to pass thunks. we select the correct thunk using the bool
+# then apply it with a value (which shouldn't get used in the function)
+if = \bool. \t. \f. (bool t f) I
 # returns c if b is true, false if b is false, therefore true when both c and b are true
 and = \b. \c. b c false
 # returns true if b is true, c if b is false, therefore true when c or b are true
@@ -64,12 +67,12 @@ succ = \n. \s. \z. s (n s z)
 # numbers take the form \s. \z. ... We bind (\x. false) to s, and true to z
 # if our number is zero, it returns z directly, which is bound to true
 # if our number is not zero, it calls the successor function s, which returns false
-zero? = \n. n (constant false) true
+zero? = \n. n (\x. false) true
 
 plus = \m. \n. \s. \z. m s (n s z)
 # notice the body s (n s z) is equivalent to succ n, so an alternative definition is
 # plus = \m. \n. m succ n
-times = \m. \n. \f. m (n f)
+mult = \m. \n. \f. m (n f)
 # alternative defintion
 # times = \m. \n. m (plus n) 0
 pow = \b. \e. e b
@@ -120,6 +123,7 @@ cons = \h. \t. \c. \n. c h t
 # returning head
 head = \l. l (\h. \t. h) nil
 tail = \l. l (\h. \t. t) nil
+cadr = compose head tail
 nil? = \l. l (\h. \t. false) true
 # maps the given function over list elements
 map = fix (\_map. \f. \l.
@@ -147,8 +151,23 @@ sub = \m. \n. n pred m
 leq? = \m. \n. zero? (sub m n)
 # identity x = y === (x <= y ^ y <= x)
 eq? = \m. \n. and (leq? m n) (leq? n m)
+gt? = \m. \n. not (leq? m n)
+geq? = \m. \n. or (gt? m n) (eq? m n)
+lt? = \m. \n. and (leq? m n) (not (eq? m n))
 
 # sums a list of church-encoded numbers
 sum = fix (\_sum. \l. l (\h. \t. succ (_sum t)) 0)
 ## sum implemented with foldl
 # sum = foldl plus 0
+
+# returns pair of (quotient, remainder)
+div = fix (\g q a b. if (lt? a b) (\_. (pair q a)) (\_. (g (succ q) (sub a b) b))) 0
+# integer division
+idiv = \x y. fst (div x y)
+mod = \x y. snd (div x y)
+fact = fix (\_fact x. if (zero? x) (\_. 1) (\_. (mult x (_fact (pred x))))) 0
+
+num_to_dig = (fix (\_fn xs n.
+                        (if (zero? n)
+                            (\x. xs)
+                            (\x. (_fn (cons (mod n 10) xs) (idiv n 10)))))) nil

@@ -6,103 +6,12 @@
  *    \x.t   # abstraction
  *    t t    # application
  */
-import {
-  addbinding,
-  addname,
-  Binding,
-  Context,
-  ctxlength,
-  name2index,
-} from './context'
-import { mkTok, scanner, streamScanner, Token } from './scanner'
-import { Info, ParseError } from './support'
-import { arrEquals, DiscriminateUnion } from './util'
-
-type NodeKind = 'var' | 'abs' | 'app'
-
-export interface Node {
-  kind: NodeKind
-  tokens?: Token[]
-  info: Info
-}
-
-export interface VariableNode extends Node {
-  kind: 'var'
-  /** de Bruijn index */
-  idx: number
-  /** contains the total length of the ctx in which var occurs */
-  depth: number
-}
-
-export interface AbstractionNode extends Node {
-  kind: 'abs'
-  term: Term
-  varname?: string
-}
-
-export interface ApplicationNode extends Node {
-  kind: 'app'
-  left: Term
-  right: Term
-}
-
-export type Term = VariableNode | AbstractionNode | ApplicationNode
-export type EvalCommand = {
-  kind: 'eval'
-  info: Info
-  term: Term
-  tokens?: Token[]
-}
-export type BindCommand = {
-  kind: 'bind'
-  info: Info
-  name: string
-  binding: Binding
-  tokens?: Token[]
-}
-export type Command = EvalCommand | BindCommand
-
-/** Maps over the abstract syntax tree of terms */
-export const termWalk = (fn: (v: VariableNode, depth: number) => Term) => (
-  startDepth: number = 0,
-) => (initTerm: Term): Term => {
-  const stack: Array<{ c: number; t: Term }> = []
-  const term = { ...initTerm }
-  stack.push({ c: startDepth, t: term })
-
-  while (stack.length !== 0) {
-    const { c, t } = stack.pop()!
-    switch (t.kind) {
-      case 'var': {
-        const s = { ...fn(t, c) }
-        // we have to keep the same reference
-        for (const key in t) {
-          if (t.hasOwnProperty(key)) {
-            delete (t as any)[key]
-          }
-        }
-        Object.assign(t, s)
-        break
-      }
-      case 'abs': {
-        const term = { ...t.term }
-        t.term = term
-        stack.push({ c: c + 1, t: term })
-        break
-      }
-      case 'app': {
-        const left = { ...t.left }
-        const right = { ...t.right }
-        t.left = left
-        t.right = right
-        stack.push({ c, t: left })
-        stack.push({ c, t: right })
-        break
-      }
-    }
-  }
-  return term
-}
+import { addname, Context, ctxlength, name2index } from '../context'
+import { mkTok, scanner, streamScanner, Token } from '../scanner'
+import { Info, ParseError } from '../support'
+import { arrEquals, DiscriminateUnion } from '../util'
+import { bindCmd, Command, evalCmd } from './command'
+import { abs, AbstractionNode, Term } from './term'
 
 type PeekReq = {
   kind: 'peek'
@@ -157,6 +66,11 @@ function* parse(ctx: Context) {
     return b.value
   }
 
+  function* peekNext() {
+    const next = yield* peek()
+    return next.length >= 1 ? next[0] : undefined
+  }
+
   function* read(): Generator<TokRequest, ReadResponse['value'], TokResponse> {
     const b = yield { kind: 'read' }
     expectRead(b)
@@ -193,22 +107,38 @@ function* parse(ctx: Context) {
     return v
   }
 
+  /*
+   * term ::= x             (variable)
+   *       |  \x*. t        (abstraction)
+   *       |  t t           (application)
+   * command ::= x = term;   (binding)
+   *          |  term;       (evaluate)
+   */
+
   function* command(
     ctx: Context,
   ): Generator<TokRequest, [Command, Context] | undefined | null, TokResponse> {
     if (yield* tryMatch('var', 'equals')) {
       const v = yield* readExpecting('var', 'identfier')
+      // we reserve ` for scoping our builtin bindings
+      // purely a hack to allow accessing native apis, shouldn't
+      // exist in a compiled version
+      if (v.value.startsWith('`')) {
+        throw new ParseError(
+          v.info,
+          `Illegal identifier for binding: ${JSON.stringify(v.value)}`,
+        )
+      }
       const e = yield* readExpecting('equals', '"="')
       const t = yield* term(ctx)
+      const [binding, newctx] = bindCmd(ctx)(v.value, t)
       return [
         {
-          kind: 'bind',
+          ...binding,
           info: v.info,
-          binding: { kind: 'var', term: t },
-          name: v.value,
           tokens: [v, e, ...(t.tokens ?? [])],
         },
-        addbinding(ctx, v.value, { kind: 'var', term: t }),
+        newctx,
       ]
     }
     if ((yield* tryMatch('newline')) || (yield* tryMatch('semicolon'))) {
@@ -218,59 +148,122 @@ function* parse(ctx: Context) {
     }
     if (!(yield* done())) {
       const t = yield* term(ctx)
-      return [{ kind: 'eval', term: t, info: t.info, tokens: t.tokens }, ctx]
+      return [{ ...evalCmd(t), info: t.info, tokens: t.tokens }, ctx]
     }
 
     return null
+  }
+
+  function* consumeNewlines() {
+    let next = yield* peekNext()
+    while (next && next.kind === 'newline') {
+      // consume newline
+      yield* read()
+      next = yield* peekNext()
+    }
+  }
+
+  function* absterm(
+    ctx: Context,
+    inparen = false,
+  ): Generator<TokRequest, Term, TokResponse> {
+    const slash = yield* readExpecting('backslash', '"\\"')
+    const vs = yield* termBinders()
+    if (vs.length === 0) {
+      throw new ParseError(
+        slash.info,
+        `Expected at least one binding variable, received 0`,
+      )
+    }
+    const dot = yield* readExpecting('dot', '"."')
+    const newctx = vs.reduce((prevCtx, v) => addname(prevCtx, v.value), ctx)
+    if (inparen) {
+      yield* consumeNewlines()
+    }
+    const t = yield* term(newctx, inparen)
+
+    return vs.reduceRight(
+      (t, v): AbstractionNode => ({
+        kind: 'abs',
+        info: slash.info,
+        tokens: [slash, ...vs, dot, ...(t.tokens ?? [])],
+        varname: v.value,
+        term: t,
+      }),
+      t,
+    )
+  }
+
+  function* termBinders(): Generator<TokRequest, Token[], TokResponse> {
+    const vars: Token[] = []
+    while (yield* tryMatch('var')) {
+      vars.push(yield* readExpecting('var', 'identifier'))
+    }
+
+    return vars
+  }
+
+  function* parenterm(ctx: Context): Generator<TokRequest, Term, TokResponse> {
+    const open = yield* readExpecting('openparen', '"("')
+    yield* consumeNewlines()
+    const t = yield* term(ctx, true)
+    yield* consumeNewlines()
+    const close = yield* readExpecting('closeparen', '")"')
+    return { ...t, tokens: [open, ...(t.tokens ?? []), close] }
+  }
+
+  function* varterm(ctx: Context): Generator<TokRequest, Term, TokResponse> {
+    const r = yield* readExpecting('var', 'identifier')
+    const idx = name2index(ctx, r.value)
+    if (idx === undefined) {
+      throw new ParseError(r.info, `Identifier ${r.value} is unbound`)
+    }
+    return {
+      kind: 'var',
+      idx,
+      depth: ctxlength(ctx),
+      info: r.info,
+      tokens: [r],
+    }
+  }
+
+  // matches a variable or a term in parentheses
+  function* atomicterm(
+    ctx: Context,
+    inparen = false,
+  ): Generator<TokRequest, Term, TokResponse> {
+    if (yield* tryMatch('openparen')) {
+      return yield* parenterm(ctx)
+    }
+
+    if (yield* tryMatch('var')) {
+      return yield* varterm(ctx)
+    }
+
+    return yield* absterm(ctx, inparen)
+  }
+
+  function* startsTerm() {
+    const nextT = yield* peekNext()
+    return (
+      nextT &&
+      (nextT.kind === 'openparen' ||
+        nextT.kind === 'backslash' ||
+        nextT.kind === 'var')
+    )
   }
 
   function* term(
     ctx: Context,
     inparen = false,
   ): Generator<TokRequest, Term, TokResponse> {
-    const app = yield* appterm(ctx, inparen)
-    if (app) return app
-
-    const slash = yield* readExpecting('backslash', '"\\"')
-    const v = yield* readExpecting('var', 'identifier')
-    const dot = yield* readExpecting('dot', '"."')
-    const t = yield* term(addname(ctx, v.value), inparen)
-
-    return {
-      kind: 'abs',
-      info: slash.info,
-      tokens: [slash, v, dot, ...(t.tokens ?? [])],
-      varname: v.value,
-      term: t,
-    }
-  }
-
-  function* tryatomic(
-    ctx: Context,
-    inparen = false,
-  ): Generator<TokRequest, Term | undefined, TokResponse> {
-    let v: Term | boolean = false
-    do {
-      v = yield* atomicterm(ctx)
-      if (v === true) {
-        // consume newline
-        yield* read()
-      }
-    } while (v === true && inparen)
-
-    return typeof v === 'boolean' ? undefined : v
-  }
-
-  function* appterm(
-    ctx: Context,
-    inparen = false,
-  ): Generator<TokRequest, Term | undefined, TokResponse> {
-    let lapp = yield* tryatomic(ctx, inparen)
+    let lapp = yield* atomicterm(ctx, inparen)
     let rapp: Term | undefined = undefined
-    if (!lapp) return undefined
-
     do {
-      rapp = yield* tryatomic(ctx, inparen)
+      if (inparen) {
+        yield* consumeNewlines()
+      }
+      rapp = (yield* startsTerm()) ? yield* atomicterm(ctx, inparen) : undefined
       if (rapp) {
         lapp = {
           kind: 'app',
@@ -283,38 +276,6 @@ function* parse(ctx: Context) {
     } while (rapp !== undefined)
 
     return lapp
-  }
-
-  function* atomicterm(
-    ctx: Context,
-  ): Generator<TokRequest, Term | boolean, TokResponse> {
-    if (yield* tryMatch('openparen')) {
-      const open = yield* readExpecting('openparen', '"("')
-      const t = yield* term(ctx, true)
-      const close = yield* readExpecting('closeparen', '")"')
-      return { ...t, tokens: [open, ...(t.tokens ?? []), close] }
-    }
-
-    if (yield* tryMatch('var')) {
-      const r = yield* readExpecting('var', 'identifier')
-      const idx = name2index(ctx, r.value)
-      if (idx === undefined) {
-        throw new ParseError(r.info, `Identifier ${r.value} is unbound`)
-      }
-      return {
-        kind: 'var',
-        idx,
-        depth: ctxlength(ctx),
-        info: r.info,
-        tokens: [r],
-      }
-    }
-
-    if (yield* tryMatch('newline')) {
-      return true
-    }
-
-    return false
   }
 
   let e: [Command, Context] | undefined | null = null
